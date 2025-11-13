@@ -1,1 +1,394 @@
-ss
+-----Jenkinsfile
+
+pipeline {
+    agent any                     // Run this pipeline on any available Jenkins agent (node)
+
+    environment {
+        SONAR_HOME = tool "Sonar" 
+                       // Define SONAR_HOME using the tool named "Sonar" (SonarQube Scanner)
+
+        KUBECONFIG_CREDENTIAL_ID = 'kubeconfig-cred-id'
+                                                                                // Jenkins credentials for kubeconfig
+        SLACK_CHANNEL = '#ci-cd-alerts'                            // Slack channel name
+        DOCKER_IMAGE = 'my-app'
+        TAG          = 'v1.0'  OR ‘latest’
+  OR  TAG_NAME = sh(script: "git describe --tags --abbrev=0", returnStdout: true).trim()
+		                                    // get the latest Git tag from a repository
+   }
+
+stages {
+
+        stage("Workspace cleanup"){
+            steps{
+                script{
+                    cleanWs()
+                }
+            }
+        }
+
+        stage("Clone Code from GitHub") {
+            steps {
+                git url: "https://github.com/SudarshanKDeore/wanderlust.git", branch: "main"  
+                                                   // Clone the code from the GitHub repository from the "devops" branch
+            }
+        }
+
+        stage("SonarQube Quality Analysis") {
+            steps {
+                withSonarQubeEnv("Sonar") {  
+                                                                  // Use SonarQube environment named "Sonar" (configured in Jenkins)
+                    sh """
+                        ${SONAR_HOME}/bin/sonar-scanner \                                // Run the SonarQube scanner CLI
+                        -Dsonar.projectKey=wanderlust \                                   //Set the unique project key in SonarQube
+                     -Dsonar.projectName=wanderlust                             //Set the display name of the project in SonarQube
+                    """
+                }
+            }
+        }
+
+        stage("OWASP Dependency Check") {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./', odcInstallation: 'dc'  
+                                      // Run OWASP Dependency-Check on the current directory using tool named "dc"
+                
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'  
+                                                    // Publish the Dependency-Check report with matching XML file pattern
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: '**/dependency-check-report.xml', fingerprint: true                       
+		                                                                 // Archive OWASP Dependency report
+	} } 
+        }
+
+        stage("Sonar Quality Gate Scan") {
+            steps {
+                timeout(time: 2, unit: 'MINUTES')                            //Set a timeout of 2 minutes for this stage
+	{
+                    waitForQualityGate abortPipeline: false  
+                                                // Wait for the SonarQube Quality Gate result; don’t abort the pipeline if it fails
+                }
+            }
+        }
+        stage("Trivy File System Scan") {
+            steps {
+                sh "trivy fs --format table -o trivy-fs-report.html ."  
+                           // Scan the current directory with Trivy for vulnerabilities and save the report in table format
+               post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-fs-report.html', fingerprint: true         	   
+				                                // Archive Trivy HTML report
+	}}			
+           }
+        }
+
+        stage("Deploy using Docker Compose") {
+            steps {
+                sh "docker-compose up -d"        
+ 	                     // Start the application using Docker Compose in detached (background) mode
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                 dir('api') {
+                       sh "docker build -t ${DOCKER_IMAGE}:${TAG} ."
+                                 }
+                      }
+              }
+
+         stage('Tag, Login & Push to DockerHub') {
+             steps {
+               withCredentials([
+                 usernamePassword(
+                      credentialsId: 'dockerhub-creds',
+                      usernameVariable: 'DOCKERHUB_USER',
+                      passwordVariable: 'DOCKERHUB_PASS')]) 
+	{
+                    sh """
+                          docker tag ${DOCKER_IMAGE}:${TAG} "$DOCKERHUB_USER/${DOCKER_IMAGE}:${TAG}"
+
+            OR  sh “docker tag <Image_Name> ${env.DOCKERHUBUSER}/<Image_Name>:latest"
+
+	docker login -u "$DOCKERHUB_USER" -p "$DOCKERHUB_PASS"
+              OR docker login -u $DOCKERHUB_USERNAME -p $DOCKERHUB_TOKEN ${"docker.io"}
+
+	docker push "$DOCKERHUB_USER/${DOCKER_IMAGE}:${TAG}"
+	                            // Shell-based Docker Push : docker push SudarshanDockerHub/myapp:v1.0
+    OR docker_push("wanderlust-backend beta","${params.BACKEND_DOCKER_TAG}","trainwithshubham")
+                                                          // Jenkins/Groovy Function Call : docker_push(description, tag, username)
+                    """
+              }
+          }  		
+     }
+
+        stage("Kubernetes Deployment") {
+            steps {
+                withCredentials([file(credentialsId: "${KUBECONFIG_CREDENTIAL_ID}", variable: 'KUBECONFIG')]) {   
+               sh '''  export KUBECONFIG=$KUBECONFIG
+                        kubectl apply -f k8s/deployment.yaml
+                        kubectl apply -f k8s/service.yaml  '''
+                } } 
+          } 
+
+    post {
+        always {
+            cleanWs()
+        }
+
+        success {
+            echo "Docker image ${DOCKER_REPO}/${IMAGE_NAME}:${DOCKER_TAG} pushed successfully!"
+        }
+
+        failure {
+            echo "Pipeline failed."
+        }  
+       
+        success {
+            mail to: 'team@company.com',
+                 subject: 'Deployment Successful',
+                 body: 'Kubernetes Deployment completed successfully.'
+        }
+        failure {
+            mail to: 'team@company.com',
+                 subject: 'Deployment Failed',
+                 body: 'Please check Jenkins console output for errors.'
+        }   
+
+        success {
+            slackSend channel: "${SLACK_CHANNEL}", message: "✅ Build #${env.BUILD_NUMBER} succeeded for ${env.JOB_NAME}"
+            emailext subject: "Build Success: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                     body: "The Jenkins build succeeded.\n\nView it here: ${env.BUILD_URL}",
+                     recipientProviders: [[$class: 'DevelopersRecipientProvider']]  }
+
+        failure {
+            slackSend channel: "${SLACK_CHANNEL}", message: "❌ Build #${env.BUILD_NUMBER} failed for ${env.JOB_NAME}"
+            emailext subject: "Build Failure: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                     body: "The Jenkins build failed.\n\nCheck console: ${env.BUILD_URL}",
+                     recipientProviders: [[$class: 'DevelopersRecipientProvider']]
+        } 
+ } 
+    }
+}
+----Example of a Jenkinsfile that includes a Kubernetes deployment stage using credentials securely:
+
+pipeline {
+    agent any
+
+    environment {
+        REGISTRY = '1234567890.dkr.ecr.us-east-1.amazonaws.com'
+        IMAGE_NAME = 'nodejs-app'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/example/nodejs-app.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh 'docker build -t $REGISTRY/$IMAGE_NAME:latest .'
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'aws-ecr-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh '''
+                        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin $REGISTRY
+                        docker push $REGISTRY/$IMAGE_NAME:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                        kubectl apply -f k8s/deployment.yaml
+                        kubectl apply -f k8s/service.yaml
+                        kubectl rollout status deployment/nodejs-app
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success { mail to:  subject:  body:   }
+        failure {  mail to: subject:   body:  }
+    }    }
+GitOps (ArgoCD)
+Dockerfile
+
+@Library('Shared') _
+pipeline {
+    agent {label 'Node'}
+    
+    parameters {
+        string(name: 'FRONTEND_DOCKER_TAG', defaultValue: '', description: 'Frontend Docker tag of the image built by the CI job')
+        string(name: 'BACKEND_DOCKER_TAG', defaultValue: '', description: 'Backend Docker tag of the image built by the CI job')
+    }
+
+    stages {
+        stage("Workspace cleanup"){
+            steps{
+                script{
+                    cleanWs()
+                }
+            }
+        }
+        
+        stage('Git: Code Checkout') {
+            steps {
+                script{
+                    code_checkout("https://github.com/LondheShubham153/Wanderlust-Mega-Project.git","main")
+                }
+            }
+        }
+        
+        stage('Verify: Docker Image Tags') {
+            steps {
+                script{
+                    echo "FRONTEND_DOCKER_TAG: ${params.FRONTEND_DOCKER_TAG}"
+                    echo "BACKEND_DOCKER_TAG: ${params.BACKEND_DOCKER_TAG}"
+                }
+            }
+        }
+        
+        stage("Update: Kubernetes manifests"){
+            steps{
+                script{
+                    dir('kubernetes'){
+                        sh """
+                            sed -i -e s/wanderlust-backend-beta.*/wanderlust-backend-beta:${params.BACKEND_DOCKER_TAG}/g backend.yaml
+                        """
+                    }
+                    dir('kubernetes'){
+                        sh """
+                            sed -i -e s/wanderlust-frontend-beta.*/wanderlust-frontend-beta:${params.FRONTEND_DOCKER_TAG}/g frontend.yaml
+                        """
+                    }
+                    
+                }
+            }
+        }
+        
+        stage("Git: Code update and push to GitHub"){
+            steps{
+                script{
+                    withCredentials([gitUsernamePassword(credentialsId: 'Github-cred', gitToolName: 'Default')]) {
+                        sh '''
+                        echo "Checking repository status: "
+                        git status
+                    
+                        echo "Adding changes to git: "
+                        git add .
+                        
+                        echo "Commiting changes: "
+                        git commit -m "Updated environment variables"
+                        
+                        echo "Pushing changes to github: "
+                        git push https://github.com/LondheShubham153/Wanderlust-Mega-Project.git main
+                    '''
+                    }
+                }
+            }
+        }
+    }
+  post {
+        success {
+            script {
+                emailext attachLog: true,
+                from: 'trainwithshubham@gmail.com',
+                subject: "Wanderlust Application has been updated and deployed - '${currentBuild.result}'",
+                body: """
+                    <html>
+                    <body>
+                        <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: black; font-weight: bold;">Project: ${env.JOB_NAME}</p>
+                        </div>
+                        <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: black; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
+                        </div>
+                        <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: black; font-weight: bold;">URL: ${env.BUILD_URL}</p>
+                        </div>
+                    </body>
+                    </html>
+            """,
+            to: 'trainwithshubham@gmail.com',
+            mimeType: 'text/html'
+            }
+        }
+      failure {
+            script {
+                emailext attachLog: true,
+                from: 'trainwithshubham@gmail.com',
+                subject: "Wanderlust Application build failed - '${currentBuild.result}'",
+                body: """
+                    <html>
+                    <body>
+                        <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: black; font-weight: bold;">Project: ${env.JOB_NAME}</p>
+                        </div>
+                        <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
+                            <p style="color: black; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
+                        </div>
+                    </body>
+                    </html>
+            """,
+            to: 'trainwithshubham@gmail.com',
+            mimeType: 'text/html'
+            }
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----VS Code Commands
+
+--FOR GIT
+
+# git pull <Repo URL> main       	// Pull code from main branch from Remote to Local
+# git checkout -b feature			// Create New Branch & go in that branch with all code     in Local
+# git add .  , # git commit -m “msg”	// Make Changes What you wants & Commit it in Local
+# git remote remove origin 	// Remove old set Origin Branch for Remote
+# git remote add origin <Repo URL>	// Set new Origin Branch before push the Code to Rem
+# git push -u origin feature		// Push New Feature Branch with all New Code in  
+ 				Remote
+# git branch -m main		// Switch to main Branch with all New code in Local
+# git push -u origin main		// Push New code with all Changes to main Branch in Remote
+
+--FOR AWS
+
+# aws ec2 describe-instances --region ap-south-1 –query "Reservations[*].Instances[*].{Name:Tags[?Key=='Name']|[0].Value,ID:InstanceId,State:State.Name}" --output table		
+// To Check All instance Status in AWS Account From VSCode with Specific Region
+
+# 
+
+
+
+
+
